@@ -213,6 +213,13 @@ impl MouseListener {
       }
     };
 
+    // Track button state even for events that aren't emitted. Only
+    // `LeftButtonUp` is enabled, so updating after the filter below never
+    // saw the button go down: `pressed_buttons` stayed empty while a window
+    // was being resized, and focus followed the cursor into the window it
+    // passed over, which cancels the resize.
+    callback_data.pressed.update(event_kind);
+
     if !enabled_events.contains(&event_kind) {
       return Ok(());
     }
@@ -232,8 +239,6 @@ impl MouseListener {
     if !should_emit {
       return Ok(());
     }
-
-    callback_data.pressed.update(event_kind);
 
     let mouse_event = match event_kind {
       MouseEventKind::LeftButtonDown => MouseEvent::ButtonDown {
