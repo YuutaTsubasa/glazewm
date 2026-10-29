@@ -1,7 +1,6 @@
 use anyhow::Context;
 use wm_common::{
-  try_warn, ActiveDragOperation, FullscreenStateConfig, TilingDirection,
-  WindowState,
+  try_warn, FullscreenStateConfig, TilingDirection, WindowState,
 };
 use wm_platform::{Point, Rect};
 
@@ -128,30 +127,42 @@ pub fn handle_window_moved_or_resized_end(
         window.as_window_container()?
       );
 
-      // Move each dragged edge by as much as the user dragged it. Sizing
-      // the window to its new frame instead only trades space with its
-      // own siblings, which locks a window in a nested split (e.g. a
+      // Move the dragged edge by as much as the window grew or shrank.
+      // Sizing the window to its new frame instead only trades space with
+      // its own siblings, which locks a window in a nested split (e.g. a
       // quarter of the screen) inside that split.
-      if matches!(active_drag.operation, Some(ActiveDragOperation::Resize))
-      {
-        let initial = &active_drag.initial_position;
-        let frame = window.native_properties().frame;
+      //
+      // The baseline is where the WM placed the window, not the drag's
+      // initial position: that can be stale (e.g. after a workspace
+      // animation), which made resizes look like moves and get reverted.
+      // Which edge was dragged is whichever moved further from it.
+      let target = window
+        .to_rect()?
+        .apply_delta(&window.total_border_delta()?, None);
+      let frame = window.native_properties().frame;
 
-        for (is_width, is_start_edge, delta_px) in [
-          (true, true, initial.left - frame.left),
-          (true, false, frame.right - initial.right),
-          (false, true, initial.top - frame.top),
-          (false, false, frame.bottom - initial.bottom),
-        ] {
-          if delta_px != 0 {
-            resize_tiling_edge(
-              window,
-              is_width,
-              is_start_edge,
-              delta_px,
-              state,
-            )?;
-          }
+      for (is_width, start_moved, end_moved, delta_px) in [
+        (
+          true,
+          target.left - frame.left,
+          frame.right - target.right,
+          frame.width() - target.width(),
+        ),
+        (
+          false,
+          target.top - frame.top,
+          frame.bottom - target.bottom,
+          frame.height() - target.height(),
+        ),
+      ] {
+        if delta_px != 0 {
+          resize_tiling_edge(
+            window,
+            is_width,
+            start_moved.abs() > end_moved.abs(),
+            delta_px,
+            state,
+          )?;
         }
       }
 
