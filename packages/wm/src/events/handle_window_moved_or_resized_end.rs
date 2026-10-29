@@ -1,21 +1,23 @@
 use anyhow::Context;
 use wm_common::{
-  try_warn, FullscreenStateConfig, TilingDirection, WindowState,
+  try_warn, ActiveDragOperation, FullscreenStateConfig, TilingDirection,
+  WindowState,
 };
-use wm_platform::{LengthValue, Point, Rect};
+use wm_platform::{Point, Rect};
 
 use crate::{
   commands::{
     container::{move_container_within_tree, wrap_in_split_container},
-    window::{set_window_size, update_window_state},
+    window::update_window_state,
   },
   events::update_floating_window_position,
   models::{
     DirectionContainer, NonTilingWindow, SplitContainer, TilingContainer,
-    WindowContainer,
+    TilingWindow, WindowContainer,
   },
   traits::{
-    CommonGetters, PositionGetters, TilingDirectionGetters, WindowGetters,
+    CommonGetters, PositionGetters, TilingDirectionGetters,
+    TilingSizeGetters, WindowGetters, MIN_TILING_SIZE,
   },
   user_config::UserConfig,
   wm_state::WmState,
@@ -126,16 +128,32 @@ pub fn handle_window_moved_or_resized_end(
         window.as_window_container()?
       );
 
-      let frame = window.native_properties().frame;
+      // Move each dragged edge by as much as the user dragged it. Sizing
+      // the window to its new frame instead only trades space with its
+      // own siblings, which locks a window in a nested split (e.g. a
+      // quarter of the screen) inside that split.
+      if matches!(active_drag.operation, Some(ActiveDragOperation::Resize))
+      {
+        let initial = &active_drag.initial_position;
+        let frame = window.native_properties().frame;
 
-      // Update the window's size based on the new frame position. This
-      // means we use the actual window dimensions as the source of truth.
-      set_window_size(
-        window.clone().into(),
-        Some(LengthValue::from_px(frame.width())),
-        Some(LengthValue::from_px(frame.height())),
-        state,
-      )?;
+        for (is_width, is_start_edge, delta_px) in [
+          (true, true, initial.left - frame.left),
+          (true, false, frame.right - initial.right),
+          (false, true, initial.top - frame.top),
+          (false, false, frame.bottom - initial.bottom),
+        ] {
+          if delta_px != 0 {
+            resize_tiling_edge(
+              window,
+              is_width,
+              is_start_edge,
+              delta_px,
+              state,
+            )?;
+          }
+        }
+      }
 
       window.set_active_drag(None);
 
@@ -151,6 +169,82 @@ pub fn handle_window_moved_or_resized_end(
   }
 
   Ok(())
+}
+
+/// Moves one edge of a tiling window by `delta_px` (positive = outwards).
+///
+/// The space is traded with the tiling container on the other side of
+/// that edge, which may be a sibling of an ancestor split. For example, in
+/// H[1 V[2 H[3 4]]], dragging the left edge of 3 resizes V against 1.
+/// Nothing happens if the edge is at the workspace's border.
+fn resize_tiling_edge(
+  window: &TilingWindow,
+  is_width: bool,
+  is_start_edge: bool,
+  delta_px: i32,
+  state: &mut WmState,
+) -> anyhow::Result<()> {
+  let axis = if is_width {
+    TilingDirection::Horizontal
+  } else {
+    TilingDirection::Vertical
+  };
+
+  let mut container: TilingContainer = window.clone().into();
+
+  loop {
+    let parent = container
+      .parent()
+      .context("No parent.")?
+      .as_direction_container()?;
+
+    let neighbor: Option<TilingContainer> = if parent.tiling_direction()
+      == axis
+    {
+      if is_start_edge {
+        container.prev_siblings().find_map(|c| c.try_into().ok())
+      } else {
+        container.next_siblings().find_map(|c| c.try_into().ok())
+      }
+    } else {
+      None
+    };
+
+    if let Some(neighbor) = neighbor {
+      let (horizontal_gap, vertical_gap) = container.inner_gaps()?;
+      let rect = parent.to_rect()?;
+
+      #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+      let gaps = (parent.tiling_children().count() as i32 - 1)
+        * if is_width { horizontal_gap } else { vertical_gap };
+
+      let length = if is_width { rect.width() } else { rect.height() } - gaps;
+
+      if length <= 0 {
+        return Ok(());
+      }
+
+      #[allow(clippy::cast_precision_loss)]
+      let delta = (delta_px as f32 / length as f32).clamp(
+        MIN_TILING_SIZE - container.tiling_size(),
+        neighbor.tiling_size() - MIN_TILING_SIZE,
+      );
+
+      container.set_tiling_size(container.tiling_size() + delta);
+      neighbor.set_tiling_size(neighbor.tiling_size() - delta);
+
+      state
+        .pending_sync
+        .queue_containers_to_redraw(parent.tiling_children());
+
+      return Ok(());
+    }
+
+    match parent {
+      DirectionContainer::Split(split) => container = split.into(),
+      DirectionContainer::Workspace(_) => return Ok(()),
+    }
+  }
 }
 
 /// Handles transition from temporary floating window to tiling window on
